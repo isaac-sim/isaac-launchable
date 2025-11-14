@@ -79,7 +79,7 @@ This is essentially the same command you would run for a workstation install of 
 
 2. Once the training script is complete, test the policy behavior by running: 
 ```
-python isaaclab/scripts/reinforcement_learning/skrl/play.py --task=Isaac-Ant-v0 --livestream 2"
+python isaaclab/scripts/reinforcement_learning/skrl/play.py --task=Isaac-Ant-v0 --livestream 2
 ``` 
 This will launch Isaac Sim. Note how we added the `--kit_args` since we'll want to view the behavior using the Isaac Sim viewport.
 
