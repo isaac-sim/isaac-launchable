@@ -80,13 +80,13 @@ spec:
             cpu: "36"
             memory: 170Gi
             nvidia.com/gpu: "1"
-            nvidia.com/gpumem: "10000"
+            nvidia.com/gpumem: "23000"
             nvidia.com/gpucores: "50"
           limits:
             cpu: "40"
             memory: 180Gi
             nvidia.com/gpu: "1"
-            nvidia.com/gpumem: "10000"
+            nvidia.com/gpumem: "23000"
             nvidia.com/gpucores: "50"
         volumeMounts:
         - name: ov-cache

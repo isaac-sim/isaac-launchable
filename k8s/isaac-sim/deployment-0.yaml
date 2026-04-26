@@ -71,10 +71,30 @@ spec:
             cpu: "36"
             memory: 170Gi
             nvidia.com/gpu: "1"
+            nvidia.com/gpumem: "23000"
+            nvidia.com/gpucores: "50"
           limits:
             cpu: "40"
             memory: 180Gi
             nvidia.com/gpu: "1"
+            nvidia.com/gpumem: "23000"
+            nvidia.com/gpucores: "50"
+        volumeMounts:
+        - name: ov-cache
+          mountPath: /root/.cache/ov
+        - name: ov-local-share
+          mountPath: /root/.local/share/ov
+        - name: workspace-data
+          mountPath: /workspace/data
+        - name: runheadless-script
+          mountPath: /isaac-sim/runheadless.sh
+          subPath: runheadless.sh
+        - name: minio-omniverse
+          mountPath: /mnt/minio
+        - name: kit-turn
+          mountPath: /etc/kit-turn.toml
+          subPath: turn.toml
+          readOnly: true
       - name: nginx
         image: 10.61.3.124:30002/library/isaac-launchable-nginx:latest
         ports:
