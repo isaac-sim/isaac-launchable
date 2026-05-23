@@ -1,0 +1,361 @@
+# Isaac Sim 6 + Isaac Lab 3 + code-server + web-viewer + nginx sidecar — 단일 워크로드 통합 매니페스트
+# cluster-75 ws-019e1499...의 ov-a730ba25... 워크로드에서 검증된 setup
+#
+# 구성:
+# - ConfigMap 통합 (env scalar + nginx.conf + viewer-entrypoint.sh + runheadless.sh + turn.toml)
+# - Service ClusterIP (http 80/TCP만; webrtc-media는 Deployment hostPort 30998/UDP 직접 매핑)
+# - Ingress mergeable minion under placeholder.local master, path-based /ov-a730ba25
+# - Deployment 3 컨테이너 (vscode + nginx 사이드카 + web-viewer 사이드카)
+#
+# 동적화 포인트:
+# - HOST_IP / ISAACSIM_HOST: Downward API status.hostIP (노드 이동 시 자동)
+# - ISAACSIM_STREAM_PORT: ConfigMap STREAM_PORT alias (configMapKeyRef, single source)
+# - turn.toml의 TURN URL: {{HOST_IP}} placeholder, runheadless.sh가 sed로 substitute
+#
+# 외부 의존:
+# - coturn DaemonSet (별도 namespace coturn, hostNetwork=true, 모든 GPU 노드)
+# - memcached headless service (astrago/memcached, shader cache 공유)
+# - nginx-ingress controller (ingressClassName=nginx, mergeable, placeholder.local master 존재)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  namespace: ws-019e1499-e02c-719c-adbc-f795286e9893
+  labels:
+    app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+data:
+  # vscode / Kit env
+  ACCEPT_EULA: "Y"
+  OMNI_KIT_ALLOW_ROOT: "1"
+  DEFAULT_WORKSPACE: /config/workspace
+  AUTO_ENABLE_DRIVER_SHADER_CACHE_WRAPPER: hsscdns://memcached.astrago.svc.cluster.local
+  # 단일 source — STREAM_PORT (ISAACSIM_STREAM_PORT는 Deployment env에서 configMapKeyRef로 alias)
+  STREAM_PORT: "30998"
+  ISAACSIM_SIGNAL_PORT: "49100"
+  # viewer env
+  ENV: localhost
+  FORCE_WSS: "false"
+  SIGNALING_PORT: "80"
+  POD_INDEX: "0"
+  SIGNAL_URL: /ov-a730ba25/sign_in
+  BASE_PATH: /ov-a730ba25/viewer/
+  SIGNALING_PATH: /ov-a730ba25
+  # TURN (coturn DaemonSet 인증)
+  TURN_PORT: "3478"
+  TURN_USER: isaac
+  TURN_PASS: isaac
+  # HAMi vGPU preload 무력화 (image의 /etc/ld.so.preload 빈 파일 마운트)
+  ld.so.preload: ""
+
+  # nginx 사이드카 reverse proxy config — sub-path /ov-a730ba25/*
+  nginx.conf: |
+    worker_processes auto;
+    pid /etc/nginx/.nginx.pid;
+    events { worker_connections 768; }
+    http {
+      sendfile on; tcp_nodelay on; client_max_body_size 0; keepalive_timeout 65;
+      default_type application/octet-stream; gzip on;
+      server {
+        listen 80 default_server;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Prefix /ov-a730ba25;
+        proxy_buffering off;
+
+        location = /ov-a730ba25 { return 301 /ov-a730ba25/; }
+        location = /ov-a730ba25/viewer { return 301 /ov-a730ba25/viewer/; }
+
+        # Vite dev server (sub-path 그대로 forward — Vite는 --base /ov-a730ba25/viewer/로 시작)
+        location /ov-a730ba25/viewer/ {
+          proxy_pass http://localhost:5173;
+        }
+        location /ov-a730ba25/sign_in {
+          proxy_pass http://localhost:49100/sign_in;
+        }
+        location /ov-a730ba25/api/clipboard/ {
+          proxy_pass http://localhost:8011/clipboard/;
+          proxy_set_header Connection "";
+        }
+        # code-server (sub-path strip)
+        location /ov-a730ba25/ {
+          proxy_pass http://localhost:8080/;
+        }
+      }
+    }
+
+  # viewer wrapper entrypoint — Vite --base + signalingPath sed + MEDIA_PORT fallback
+  viewer-entrypoint.sh: |
+    #!/bin/bash
+    set -xeuo pipefail
+
+    ENV=${ENV:-localhost}
+    FORCE_WSS=${FORCE_WSS:-false}
+    BASE_PATH=${BASE_PATH:-/ov-a730ba25/viewer/}
+    SIGNALING_PATH=${SIGNALING_PATH:-/ov-a730ba25}
+
+    if [[ "${FORCE_WSS}" == "true" ]]; then
+      DEFAULT_SIGNALING_PORT=443
+    else
+      DEFAULT_SIGNALING_PORT=80
+    fi
+    SIGNALING_PORT=${SIGNALING_PORT:-${DEFAULT_SIGNALING_PORT}}
+
+    # Media port: MEDIA_PORT 우선, 없으면 STREAM_PORT, 없으면 30998
+    MEDIA_PORT=${MEDIA_PORT:-${STREAM_PORT:-30998}}
+
+    get_ip() {
+      case ${ENV} in
+        instance) nslookup "$(hostname)" | grep Address | head -2 | tail -1 | awk '{print $2}' ;;
+        localhost) echo "127.0.0.1" ;;
+        brev) curl -s https://icanhazip.com ;;
+        *) echo "Env ${ENV} not understood" >&2; exit 1 ;;
+      esac
+    }
+
+    IP=$(get_ip)
+    SIGNALING_SERVER=${SIGNALING_SERVER:-window.location.hostname}
+    MEDIA_SERVER=${MEDIA_SERVER:-${IP}}
+
+    sed -i "s/signalingServer: [^,]*/signalingServer: ${SIGNALING_SERVER}/" /app/web-viewer-sample/src/main.ts
+    sed -i "s/signalingPort: [^,]*/signalingPort: ${SIGNALING_PORT}/" /app/web-viewer-sample/src/main.ts
+    sed -i "s/mediaServer: '[^']*'/mediaServer: '${MEDIA_SERVER}'/" /app/web-viewer-sample/src/main.ts
+    sed -i "s/mediaPort: [^,]*/mediaPort: ${MEDIA_PORT}/" /app/web-viewer-sample/src/main.ts || true
+    sed -i "s/forceWSS: [^,]*/forceWSS: ${FORCE_WSS}/" /app/web-viewer-sample/src/main.ts
+
+    if ! grep -q "signalingPath:" /app/web-viewer-sample/src/main.ts; then
+      sed -i "/forceWSS:/a\\            signalingPath: '${SIGNALING_PATH}'," /app/web-viewer-sample/src/main.ts
+    else
+      sed -i "s|signalingPath: '[^']*'|signalingPath: '${SIGNALING_PATH}'|" /app/web-viewer-sample/src/main.ts
+    fi
+
+    exec npm run dev -- --host 0.0.0.0 --base "${BASE_PATH}"
+
+  # Kit runheadless.sh override — HOST_IP fallback + STREAM_PORT + turn.toml substitute
+  runheadless.sh: |
+    #!/bin/sh
+    pkill -f 'isaacsim.exp.full.streaming.kit' 2>/dev/null || true
+    sleep 1
+
+    # Host IP: ISAACSIM_HOST 우선, 없으면 Downward API HOST_IP, 없으면 127.0.0.1
+    HOST_IP_RESOLVED=${ISAACSIM_HOST:-${HOST_IP:-127.0.0.1}}
+    # Stream port: ISAACSIM_STREAM_PORT 우선, 없으면 STREAM_PORT, 없으면 30998
+    STREAM_PORT_RESOLVED=${ISAACSIM_STREAM_PORT:-${STREAM_PORT:-30998}}
+
+    EXTRA_FLAGS=""
+    EXTRA_FLAGS="${EXTRA_FLAGS} --/exts/omni.kit.livestream.app/primaryStream/publicIp=${HOST_IP_RESOLVED}"
+    [ -n "${ISAACSIM_SIGNAL_PORT}" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --/exts/omni.kit.livestream.app/primaryStream/signalPort=${ISAACSIM_SIGNAL_PORT}"
+    EXTRA_FLAGS="${EXTRA_FLAGS} --/exts/omni.kit.livestream.app/primaryStream/streamPort=${STREAM_PORT_RESOLVED}"
+
+    # TURN override — turn.toml의 {{HOST_IP}} placeholder를 실제 노드 IP로 substitute
+    TURN_FLAG=""
+    if [ -f /etc/kit-turn.toml ]; then
+      sed "s/{{HOST_IP}}/${HOST_IP_RESOLVED}/g" /etc/kit-turn.toml > /tmp/kit-turn.toml
+      TURN_FLAG="--merge-config=/tmp/kit-turn.toml"
+    fi
+
+    /isaac-sim/license.sh && /isaac-sim/privacy.sh && /isaac-sim/isaac-sim.streaming.sh \
+        $TURN_FLAG \
+        $EXTRA_FLAGS \
+        "$@"
+
+  # Kit TURN iceServers override — placeholder는 runheadless.sh가 substitute
+  turn.toml: |
+    [settings.exts."omni.kit.livestream.webrtc"]
+    iceServers = "[{\"urls\":[\"turn:{{HOST_IP}}:3478?transport=udp\",\"turn:{{HOST_IP}}:3478?transport=tcp\"],\"username\":\"isaac\",\"credential\":\"isaac\"}]"
+    iceTransportPolicy = "relay"
+---
+# ClusterIP — http 80/TCP만 노출 (ingress용); webrtc-media는 Deployment hostPort로 직접 노출
+apiVersion: v1
+kind: Service
+metadata:
+  name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  namespace: ws-019e1499-e02c-719c-adbc-f795286e9893
+  labels:
+    app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+spec:
+  type: ClusterIP
+  selector:
+    app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+---
+# Mergeable minion ingress under placeholder.local master (astrago-master)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  namespace: ws-019e1499-e02c-719c-adbc-f795286e9893
+  labels:
+    app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  annotations:
+    nginx.org/mergeable-ingress-type: minion
+    nginx.org/proxy-buffering: "false"
+    nginx.org/proxy-connect-timeout: 3600s
+    nginx.org/proxy-read-timeout: 3600s
+    nginx.org/proxy-send-timeout: 3600s
+    nginx.org/websocket-services: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: placeholder.local
+      http:
+        paths:
+          - path: /ov-a730ba25
+            pathType: Prefix
+            backend:
+              service:
+                name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+                port:
+                  number: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  namespace: ws-019e1499-e02c-719c-adbc-f795286e9893
+  labels:
+    app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+    astrago.io/domain: omniverse
+    astrago.io/omniverse-type: ISAAC
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+  template:
+    metadata:
+      labels:
+        app: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+        astrago.io/domain: omniverse
+        astrago.io/omniverse-type: ISAAC
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ws-node074
+      containers:
+        # ─── Web Viewer (Vite dev) ────────────────────────────────────────
+        - name: web-viewer
+          image: 10.61.3.75:30002/astrago-deployment/isaac-launchable-viewer:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scripts/entrypoint.sh"]
+          ports:
+            - name: viewer
+              containerPort: 5173
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+          env:
+            - name: MEDIA_SERVER
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            - name: HOST_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+          volumeMounts:
+            - name: viewer-entrypoint
+              mountPath: /scripts
+              readOnly: true
+
+        # ─── Nginx 사이드카 (sub-path reverse proxy) ──────────────────────
+        - name: nginx
+          image: 10.61.3.75:30002/astrago-deployment/isaac-launchable-nginx:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+
+        # ─── VSCode + Isaac Sim 6 + Isaac Lab 3 (메인) ────────────────────
+        - name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+          image: 10.61.3.75:30002/astrago_omniverse/isaac-launchable-vscode:6.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: webrtc-media
+              containerPort: 30998
+              hostPort: 30998
+              protocol: UDP
+            - name: webrtc-signal
+              containerPort: 49100
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+          # Downward API + ConfigMap key alias로 legacy env 호환 유지 (single source)
+          env:
+            - name: HOST_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            - name: ISAACSIM_HOST
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            - name: ISAACSIM_STREAM_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+                  key: STREAM_PORT
+          resources:
+            requests:
+              cpu: "4"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            # HAMi vGPU preload 무력화 (빈 파일 마운트)
+            - name: no-vgpu
+              mountPath: /etc/ld.so.preload
+              subPath: ld.so.preload
+              readOnly: true
+            # Kit TURN override (placeholder, runheadless.sh가 substitute)
+            - name: kit-turn
+              mountPath: /etc/kit-turn.toml
+              subPath: turn.toml
+              readOnly: true
+            # runheadless.sh override (HOST_IP/STREAM_PORT fallback + turn.toml sub)
+            - name: runheadless-script
+              mountPath: /isaac-sim/runheadless.sh
+              subPath: runheadless.sh
+              readOnly: true
+
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+            items:
+              - { key: nginx.conf, path: nginx.conf }
+        - name: viewer-entrypoint
+          configMap:
+            name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+            defaultMode: 0755
+            items:
+              - { key: viewer-entrypoint.sh, path: entrypoint.sh }
+        - name: no-vgpu
+          configMap:
+            name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+            items:
+              - { key: ld.so.preload, path: ld.so.preload }
+        - name: kit-turn
+          configMap:
+            name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+            items:
+              - { key: turn.toml, path: turn.toml }
+        - name: runheadless-script
+          configMap:
+            name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
+            defaultMode: 0755
+            items:
+              - { key: runheadless.sh, path: runheadless.sh }
