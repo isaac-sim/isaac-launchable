@@ -136,21 +136,39 @@ data:
 
     exec npm run dev -- --host 0.0.0.0 --base "${BASE_PATH}"
 
-  # Kit runheadless.sh override — HOST_IP fallback + STREAM_PORT + turn.toml substitute
+  # Kit runheadless.sh override — 전체 작동 레시피를 접어넣어 표준 진입점이 그대로 동작:
+  #   ACCEPT_EULA=Y /isaac-sim/runheadless.sh --enable isaacsim.ros2.bridge
+  # (1) conda 격리: code-server 터미널이 auto-activate한 /opt/ros_env PYTHONPATH가
+  #     Kit python을 잘못된 rclpy로 보냄 → unset해서 Kit internal rclpy 로드
+  # (2) LD_LIBRARY_PATH: C++ 브리지가 librmw_fastrtps_cpp.so를 여기서 dlopen
+  # (3) NVST 미디어 UDP: publicEndpointAddress=candidate gathering 트리거,
+  #     publicEndpointPort==fixedHostPort==streamPort=hostPort 고정 (브라우저 직결)
   runheadless.sh: |
     #!/bin/sh
     pkill -f 'isaacsim.exp.full.streaming.kit' 2>/dev/null || true
     sleep 1
 
-    # Host IP: ISAACSIM_HOST 우선, 없으면 Downward API HOST_IP, 없으면 127.0.0.1
-    HOST_IP_RESOLVED=${ISAACSIM_HOST:-${HOST_IP:-127.0.0.1}}
-    # Stream port: ISAACSIM_STREAM_PORT 우선, 없으면 STREAM_PORT, 없으면 30998
+    # (1) conda 격리 — RoboStack env 제거, Kit internal rclpy 사용
+    unset PYTHONPATH CONDA_PREFIX CONDA_DEFAULT_ENV
+
+    # (2) 브리지 RMW libs — distro 자동감지 (humble=Sim5.1, jazzy=Sim6.0)
+    DISTRO="$(ls /isaac-sim/exts/isaacsim.ros2.bridge/ 2>/dev/null | grep -xE 'humble|jazzy' | head -1)"
+    [ -n "${DISTRO}" ] && export LD_LIBRARY_PATH="/isaac-sim/exts/isaacsim.ros2.bridge/${DISTRO}/lib:${LD_LIBRARY_PATH:-}"
+
+    # Host/Port: webrtc 7.0.0은 candidate IP를 NODE ip로 강제, pod는 POD ip로 listen.
+    # POD ip(hostname -i)를 advertise하고 hostPort DNAT(node-ip:PORT→pod:PORT)로 연결.
+    POD_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
+    HOST_IP_RESOLVED=${ISAACSIM_HOST:-${POD_IP:-127.0.0.1}}
     STREAM_PORT_RESOLVED=${ISAACSIM_STREAM_PORT:-${STREAM_PORT:-30998}}
 
     EXTRA_FLAGS=""
     EXTRA_FLAGS="${EXTRA_FLAGS} --/exts/omni.kit.livestream.app/primaryStream/publicIp=${HOST_IP_RESOLVED}"
     [ -n "${ISAACSIM_SIGNAL_PORT}" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --/exts/omni.kit.livestream.app/primaryStream/signalPort=${ISAACSIM_SIGNAL_PORT}"
     EXTRA_FLAGS="${EXTRA_FLAGS} --/exts/omni.kit.livestream.app/primaryStream/streamPort=${STREAM_PORT_RESOLVED}"
+    # (3) NVST 미디어 UDP — candidate gathering + hostPort 고정
+    EXTRA_FLAGS="${EXTRA_FLAGS} --/app/livestream/publicEndpointAddress=${HOST_IP_RESOLVED}"
+    EXTRA_FLAGS="${EXTRA_FLAGS} --/app/livestream/publicEndpointPort=${STREAM_PORT_RESOLVED}"
+    EXTRA_FLAGS="${EXTRA_FLAGS} --/app/livestream/fixedHostPort=${STREAM_PORT_RESOLVED}"
 
     # TURN override — turn.toml의 {{HOST_IP}} placeholder를 실제 노드 IP로 substitute
     TURN_FLAG=""
@@ -305,14 +323,19 @@ spec:
                 configMapKeyRef:
                   name: ov-a730ba25-8628-49df-8c3c-68460a1b57a3
                   key: STREAM_PORT
+          # Isaac Sim RTX + PhysX + WebRTC 인코딩 + ROS 브리지는 멀티스레드라
+          # CPU 4코어 캡에서 심하게 throttle됨(실측: throttled ~11,500초 → FPS 5).
+          # 노드는 128코어/527GB라 한가함. 워크로드 2개가 들어가도록(2 GPU 한도)
+          # 각 pod에 CPU 32(limit)·메모리 48Gi(limit)까지 허용.
+          #   2 workloads: req 16×2=32core/32Gi×2, limit 32×2=64core/48Gi×2 ≪ 128core/527GB
           resources:
             requests:
-              cpu: "4"
+              cpu: "16"
               memory: 32Gi
               nvidia.com/gpu: "1"
             limits:
-              cpu: "4"
-              memory: 32Gi
+              cpu: "32"
+              memory: 48Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             # HAMi vGPU preload 무력화 (빈 파일 마운트)
