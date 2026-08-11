@@ -28,10 +28,10 @@ RUN echo 'registry=https://registry.npmjs.org/' > /root/.npmrc && \
     echo '@nvidia:registry=https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm-local/' >> /root/.npmrc
 
 # Install create-ov-web-sample
-RUN npm install -g @nvidia/create-ov-web-sample@1.13.4 --ignore-scripts
+RUN npm install -g @nvidia/create-ov-web-rtc-app@2.1.5 --ignore-scripts
 
 # Generate web-viewer-sample
-RUN create-ov-web-sample --name="web-viewer-sample" --sample=viewport-only --external --outputDir=/app
+RUN create-ov-web-rtc-app --name="web-viewer-sample" --sample=local-sample --external --outputDir=/app
 
 WORKDIR /app/web-viewer-sample
 

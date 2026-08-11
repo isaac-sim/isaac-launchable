@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Git Flow"
+  short_description: "Prepare squash releases on origin main"
+  default_prompt: "Use $release-git-flow to prepare a tagged squash release from dev onto origin main."
