@@ -27,11 +27,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
 RUN echo 'registry=https://registry.npmjs.org/' > /root/.npmrc && \
     echo '@nvidia:registry=https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm-local/' >> /root/.npmrc
 
-# Install create-ov-web-sample
+# Install create-ov-web-rtc-app
 RUN npm install -g @nvidia/create-ov-web-rtc-app@2.1.5 --ignore-scripts
 
 # Generate web-viewer-sample
-RUN create-ov-web-rtc-app --name="web-viewer-sample" --sample=local-sample --external --outputDir=/app
+RUN create-ov-web-rtc-app --name="web-viewer-sample" --sample=local-sample --external --outputDir=/app sample-app --framework=react
 
 WORKDIR /app/web-viewer-sample
 
@@ -39,7 +39,7 @@ WORKDIR /app/web-viewer-sample
 RUN sed -i "s/export default defineConfig({/export default defineConfig({\n  base: '\/viewer\/',\n  server: {\n    allowedHosts: true\n  },/" vite.config.ts
 
 # Add configurable stream settings with placeholder defaults (replaced at runtime by entrypoint)
-RUN sed -i "s/signalingServer: '127.0.0.1',/signalingServer: __SIGNALING_SERVER__,\n            signalingPort: __SIGNALING_PORT__,\n            mediaServer: '__MEDIA_SERVER__',\n            forceWSS: __FORCE_WSS__,/" src/main.ts
+RUN sed -i "s/signalingServer: '127.0.0.1',/signalingServer: __SIGNALING_SERVER__,\n            signalingPort: __SIGNALING_PORT__,\n            mediaServer: '__MEDIA_SERVER__',\n            forceWSS: __FORCE_WSS__,/" src/main.tsx
 
 # Install dependencies
 RUN npm install --ignore-scripts
